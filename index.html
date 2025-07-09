@@ -1,0 +1,482 @@
+// Account & Data Deletion Implementation
+// This code provides both full account deletion and selective data deletion
+
+// 1. DATABASE SCHEMA ADDITIONS
+// Add these fields to your user table if not already present:
+/*
+ALTER TABLE users ADD COLUMN deletion_requested_at TIMESTAMP NULL;
+ALTER TABLE users ADD COLUMN deletion_scheduled_for TIMESTAMP NULL;
+ALTER TABLE users ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE;
+*/
+
+// 2. BACKEND API ENDPOINTS
+
+// Full Account Deletion Endpoint
+app.post('/api/account/delete', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { password, confirmation } = req.body;
+    
+    // Verify password for security
+    const user = await User.findById(userId);
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    
+    if (!isPasswordValid) {
+      return res.status(400).json({ error: 'Invalid password' });
+    }
+    
+    if (confirmation !== 'DELETE') {
+      return res.status(400).json({ error: 'Confirmation text must be "DELETE"' });
+    }
+    
+    // Schedule deletion (30-day grace period)
+    const deletionDate = new Date();
+    deletionDate.setDate(deletionDate.getDate() + 30);
+    
+    await User.update(userId, {
+      deletion_requested_at: new Date(),
+      deletion_scheduled_for: deletionDate
+    });
+    
+    // Send confirmation email
+    await sendDeletionConfirmationEmail(user.email, deletionDate);
+    
+    res.json({ 
+      message: 'Account deletion scheduled',
+      deletion_date: deletionDate
+    });
+    
+  } catch (error) {
+    console.error('Account deletion error:', error);
+    res.status(500).json({ error: 'Failed to process deletion request' });
+  }
+});
+
+// Cancel Account Deletion
+app.post('/api/account/cancel-deletion', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    
+    await User.update(userId, {
+      deletion_requested_at: null,
+      deletion_scheduled_for: null
+    });
+    
+    res.json({ message: 'Account deletion cancelled' });
+    
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to cancel deletion' });
+  }
+});
+
+// Selective Data Deletion Endpoint
+app.post('/api/data/delete', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { dataTypes } = req.body; // Array of data types to delete
+    
+    const deletionPromises = [];
+    
+    if (dataTypes.includes('activity_history')) {
+      deletionPromises.push(ActivityLog.deleteByUserId(userId));
+    }
+    
+    if (dataTypes.includes('search_history')) {
+      deletionPromises.push(SearchHistory.deleteByUserId(userId));
+    }
+    
+    if (dataTypes.includes('preferences')) {
+      deletionPromises.push(UserPreferences.resetToDefault(userId));
+    }
+    
+    if (dataTypes.includes('uploaded_files')) {
+      deletionPromises.push(UserFiles.deleteByUserId(userId));
+    }
+    
+    if (dataTypes.includes('chat_history')) {
+      deletionPromises.push(ChatMessages.deleteByUserId(userId));
+    }
+    
+    await Promise.all(deletionPromises);
+    
+    res.json({ 
+      message: 'Selected data deleted successfully',
+      deleted_types: dataTypes
+    });
+    
+  } catch (error) {
+    console.error('Data deletion error:', error);
+    res.status(500).json({ error: 'Failed to delete selected data' });
+  }
+});
+
+// 3. SCHEDULED CLEANUP JOB
+// Run this daily via cron job or task scheduler
+async function processScheduledDeletions() {
+  try {
+    const usersToDelete = await User.findWhere({
+      deletion_scheduled_for: { '<=': new Date() },
+      is_deleted: false
+    });
+    
+    for (const user of usersToDelete) {
+      // Delete all user data
+      await Promise.all([
+        ActivityLog.deleteByUserId(user.id),
+        SearchHistory.deleteByUserId(user.id),
+        UserPreferences.deleteByUserId(user.id),
+        UserFiles.deleteByUserId(user.id),
+        ChatMessages.deleteByUserId(user.id),
+        // Add other data deletion calls here
+      ]);
+      
+      // Mark user as deleted (or actually delete the record)
+      await User.update(user.id, { is_deleted: true });
+      
+      console.log(`User ${user.id} data deleted successfully`);
+    }
+    
+  } catch (error) {
+    console.error('Scheduled deletion error:', error);
+  }
+}
+
+// 4. FRONTEND REACT COMPONENTS
+
+// Account Deletion Component
+const AccountDeletionModal = ({ isOpen, onClose }) => {
+  const [password, setPassword] = useState('');
+  const [confirmation, setConfirmation] = useState('');
+  const [isDeleting, setIsDeleting] = useState(false);
+  
+  const handleDeleteAccount = async () => {
+    if (confirmation !== 'DELETE') {
+      alert('Please type "DELETE" to confirm');
+      return;
+    }
+    
+    setIsDeleting(true);
+    
+    try {
+      const response = await fetch('/api/account/delete', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({ password, confirmation })
+      });
+      
+      const data = await response.json();
+      
+      if (response.ok) {
+        alert(`Account deletion scheduled for ${new Date(data.deletion_date).toLocaleDateString()}`);
+        onClose();
+      } else {
+        alert(data.error || 'Failed to delete account');
+      }
+    } catch (error) {
+      alert('Error deleting account');
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+  
+  if (!isOpen) return null;
+  
+  return (
+    <div className="modal-overlay">
+      <div className="modal-content">
+        <h2>Delete Account</h2>
+        <div className="warning-box">
+          <p>⚠️ This action cannot be undone. Your account will be permanently deleted in 30 days.</p>
+        </div>
+        
+        <div className="form-group">
+          <label>Enter your password:</label>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder="Password"
+          />
+        </div>
+        
+        <div className="form-group">
+          <label>Type "DELETE" to confirm:</label>
+          <input
+            type="text"
+            value={confirmation}
+            onChange={(e) => setConfirmation(e.target.value)}
+            placeholder="DELETE"
+          />
+        </div>
+        
+        <div className="button-group">
+          <button onClick={onClose}>Cancel</button>
+          <button 
+            onClick={handleDeleteAccount}
+            disabled={isDeleting || !password || confirmation !== 'DELETE'}
+            className="delete-button"
+          >
+            {isDeleting ? 'Deleting...' : 'Delete Account'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Selective Data Deletion Component
+const DataManagementPanel = () => {
+  const [selectedData, setSelectedData] = useState([]);
+  const [isDeleting, setIsDeleting] = useState(false);
+  
+  const dataTypes = [
+    { id: 'activity_history', label: 'Activity History', description: 'Your app usage and activity logs' },
+    { id: 'search_history', label: 'Search History', description: 'All your previous searches' },
+    { id: 'preferences', label: 'Preferences', description: 'App settings and preferences' },
+    { id: 'uploaded_files', label: 'Uploaded Files', description: 'Files you have uploaded' },
+    { id: 'chat_history', label: 'Chat History', description: 'All conversation history' }
+  ];
+  
+  const handleDataDeletion = async () => {
+    if (selectedData.length === 0) {
+      alert('Please select at least one data type to delete');
+      return;
+    }
+    
+    setIsDeleting(true);
+    
+    try {
+      const response = await fetch('/api/data/delete', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('token')}`
+        },
+        body: JSON.stringify({ dataTypes: selectedData })
+      });
+      
+      const data = await response.json();
+      
+      if (response.ok) {
+        alert('Selected data deleted successfully');
+        setSelectedData([]);
+      } else {
+        alert(data.error || 'Failed to delete data');
+      }
+    } catch (error) {
+      alert('Error deleting data');
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+  
+  return (
+    <div className="data-management-panel">
+      <h3>Manage Your Data</h3>
+      <p>Select the types of data you want to delete:</p>
+      
+      <div className="data-types-list">
+        {dataTypes.map(type => (
+          <div key={type.id} className="data-type-item">
+            <label>
+              <input
+                type="checkbox"
+                checked={selectedData.includes(type.id)}
+                onChange={(e) => {
+                  if (e.target.checked) {
+                    setSelectedData([...selectedData, type.id]);
+                  } else {
+                    setSelectedData(selectedData.filter(id => id !== type.id));
+                  }
+                }}
+              />
+              <div>
+                <strong>{type.label}</strong>
+                <p>{type.description}</p>
+              </div>
+            </label>
+          </div>
+        ))}
+      </div>
+      
+      <button 
+        onClick={handleDataDeletion}
+        disabled={isDeleting || selectedData.length === 0}
+        className="delete-data-button"
+      >
+        {isDeleting ? 'Deleting...' : 'Delete Selected Data'}
+      </button>
+    </div>
+  );
+};
+
+// 5. SETTINGS PAGE INTEGRATION
+const SettingsPage = () => {
+  const [showDeleteModal, setShowDeleteModal] = useState(false);
+  
+  return (
+    <div className="settings-page">
+      <h2>Account Settings</h2>
+      
+      {/* Data Management Section */}
+      <section className="settings-section">
+        <h3>Data Management</h3>
+        <DataManagementPanel />
+      </section>
+      
+      {/* Danger Zone */}
+      <section className="settings-section danger-zone">
+        <h3>Danger Zone</h3>
+        <div className="danger-actions">
+          <button 
+            onClick={() => setShowDeleteModal(true)}
+            className="danger-button"
+          >
+            Delete Account
+          </button>
+          <p>Once you delete your account, there is no going back. Please be certain.</p>
+        </div>
+      </section>
+      
+      <AccountDeletionModal 
+        isOpen={showDeleteModal}
+        onClose={() => setShowDeleteModal(false)}
+      />
+    </div>
+  );
+};
+
+// 6. CSS STYLES
+const styles = `
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.modal-content {
+  background: white;
+  padding: 2rem;
+  border-radius: 8px;
+  width: 90%;
+  max-width: 500px;
+}
+
+.warning-box {
+  background: #fff3cd;
+  border: 1px solid #ffeaa7;
+  padding: 1rem;
+  border-radius: 4px;
+  margin: 1rem 0;
+}
+
+.form-group {
+  margin: 1rem 0;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: bold;
+}
+
+.form-group input {
+  width: 100%;
+  padding: 0.5rem;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+
+.button-group {
+  display: flex;
+  gap: 1rem;
+  margin-top: 1.5rem;
+}
+
+.delete-button {
+  background: #dc3545;
+  color: white;
+  border: none;
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.delete-button:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}
+
+.danger-zone {
+  border: 1px solid #dc3545;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-top: 2rem;
+}
+
+.danger-button {
+  background: #dc3545;
+  color: white;
+  border: none;
+  padding: 0.75rem 1.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: bold;
+}
+
+.data-type-item {
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 1rem;
+  margin: 0.5rem 0;
+}
+
+.data-type-item label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  cursor: pointer;
+}
+
+.delete-data-button {
+  background: #007bff;
+  color: white;
+  border: none;
+  padding: 0.75rem 1.5rem;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-top: 1rem;
+}
+
+.delete-data-button:disabled {
+  background: #ccc;
+  cursor: not-allowed;
+}
+`;
+
+// 7. EMAIL NOTIFICATION FUNCTION
+async function sendDeletionConfirmationEmail(email, deletionDate) {
+  const emailTemplate = `
+    <h2>Account Deletion Scheduled</h2>
+    <p>Your account deletion has been scheduled for ${deletionDate.toLocaleDateString()}.</p>
+    <p>You can cancel this deletion by logging into your account and visiting Settings.</p>
+    <p>After ${deletionDate.toLocaleDateString()}, your account and all associated data will be permanently deleted.</p>
+  `;
+  
+  // Use your preferred email service (SendGrid, Mailgun, etc.)
+  // await emailService.send({
+  //   to: email,
+  //   subject: 'Account Deletion Scheduled',
+  //   html: emailTemplate
+  // });
+}
